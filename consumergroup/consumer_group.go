@@ -74,6 +74,7 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string,
 	if config.Offsets.ResetOffsets {
 		err = group.ResetOffsets()
 		if err != nil {
+			log.Printf("FAILED to reset offsets of consumergroup: %s!\n", err)
 			kz.Close()
 			return
 		}
@@ -374,7 +375,8 @@ func (cg *ConsumerGroup) consumePartition(topic string, partition int32, message
 	default:
 	}
 
-	for maxRetries, tries := 3, 0; tries < maxRetries; tries++ {
+	maxRetries := int(cg.config.Offsets.ProcessingTimeout/time.Second) + 3
+	for tries := 0; tries < maxRetries; tries++ {
 		if err := cg.instance.ClaimPartition(topic, partition); err == nil {
 			cg.Logger.Printf("[%s/%s] %s/%d claimed owner\n", cg.group.Name, cg.shortID(), topic, partition)
 			break
