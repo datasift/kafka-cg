@@ -77,15 +77,27 @@ func (zom *zookeeperOffsetManager) InitializePartition(topic string, partition i
 }
 
 func (zom *zookeeperOffsetManager) FinalizePartition(topic string, partition int32, lastOffset int64, timeout time.Duration) error {
-	zom.l.Lock()
-	defer zom.l.Unlock()
-	tracker := zom.offsets[topic][partition]
+	zom.l.RLock()
+	tracker, present := zom.offsets[topic][partition]
+	zom.l.RUnlock()
+
+	if !present {
+		return nil
+	}
 
 	if lastOffset >= 0 {
-		if lastOffset-tracker.highestMarkedAsProcessedOffset > 0 {
+		if lastOffset < tracker.highestMarkedAsProcessedOffset {
+			log.Printf("[%s/%s] %s/%d session offset backwards %d < %d",
+				zom.cg.group.Name, zom.cg.shortID(),
+				topic, partition,
+				lastOffset, tracker.highestMarkedAsProcessedOffset)
+		}
+
+		if lastOffset-tracker.highestMarkedAsProcessedOffset > 1 {
 			if !tracker.waitForOffset(lastOffset, timeout) {
-				log.Printf("[%s/%s] %s/%d TIMEOUT %ds waiting for offset %d. Last committed offset: %d\n", zom.cg.group.Name, zom.cg.shortID(),
-					topic, partition, timeout/time.Second, lastOffset,
+				log.Printf("[%s/%s] %s/%d TIMEOUT %ds waiting for offset %d-%d. Last committed offset: %d",
+					zom.cg.group.Name, zom.cg.shortID(),
+					topic, partition, timeout/time.Second, lastOffset, tracker.highestMarkedAsProcessedOffset,
 					tracker.lastCommittedOffset)
 			}
 		}
@@ -95,28 +107,32 @@ func (zom *zookeeperOffsetManager) FinalizePartition(topic string, partition int
 		}
 	}
 
+	zom.l.Lock()
 	delete(zom.offsets[topic], partition)
+	zom.l.Unlock()
 
 	return nil
 }
 
 func (zom *zookeeperOffsetManager) MarkAsProcessed(topic string, partition int32, offset int64) error {
 	zom.l.RLock()
-	defer zom.l.RUnlock()
 	if p, ok := zom.offsets[topic][partition]; ok {
+		zom.l.RUnlock()
 		return p.markAsProcessed(offset)
 	} else {
+		zom.l.RUnlock()
 		return TopicPartitionNotFound
 	}
 }
 
 func (zom *zookeeperOffsetManager) MarkAsConsumed(topic string, partition int32, offset int64) error {
 	zom.l.RLock()
-	defer zom.l.RUnlock()
 	if p, ok := zom.offsets[topic][partition]; ok {
-		p.lastConsumedOffset = offset
+		zom.l.RUnlock()
+		p.markAsConsumed(offset)
 		return nil
 	} else {
+		zom.l.RUnlock()
 		return TopicPartitionNotFound
 	}
 }
@@ -175,7 +191,7 @@ func (zom *zookeeperOffsetManager) commitOffset(topic string, partition int32, t
 	})
 
 	if err != nil && err != NoOffsetToCommit {
-		log.Printf("[%s/%s] %s/%d commit offset %d: %s\n", zom.cg.group.Name, zom.cg.shortID(),
+		log.Printf("[%s/%s] %s/%d commit offset %d: %s", zom.cg.group.Name, zom.cg.shortID(),
 			topic, partition, tracker.highestMarkedAsProcessedOffset, err)
 	}
 
@@ -186,21 +202,33 @@ func (zom *zookeeperOffsetManager) commitOffset(topic string, partition int32, t
 // it's higehr than any previous offset it has received.
 func (pot *partitionOffsetTracker) markAsProcessed(offset int64) error {
 	pot.l.Lock()
-	defer pot.l.Unlock()
 
 	if offset > pot.lastConsumedOffset+1 {
 		// last consumed msg offset=5, but client wants to commit offset=9
+		pot.l.Unlock()
+
 		return OffsetTooLarge
 	} else if offset > pot.highestMarkedAsProcessedOffset {
 		pot.highestMarkedAsProcessedOffset = offset
 		if pot.waitingForOffset == pot.highestMarkedAsProcessedOffset {
 			close(pot.done)
 		}
+
+		pot.l.Unlock()
+
 		return nil
 	} else {
+		pot.l.Unlock()
+
 		// client already committed offset=5, but now, it wants to commit offset=3
 		return OffsetBackwardsError
 	}
+}
+
+func (pot *partitionOffsetTracker) markAsConsumed(offset int64) {
+	pot.l.Lock()
+	pot.lastConsumedOffset = offset // markAsProcessed is using this var, so lock is required
+	pot.l.Unlock()
 }
 
 // Commit calls a committer function if the highest processed offset is out
@@ -215,10 +243,11 @@ func (pot *partitionOffsetTracker) commit(committer offsetCommitter) error {
 		}
 
 		pot.lastCommittedOffset = pot.highestMarkedAsProcessedOffset
-		return nil
 	} else {
 		return NoOffsetToCommit
 	}
+
+	return nil
 }
 
 func (pot *partitionOffsetTracker) waitForOffset(offset int64, timeout time.Duration) bool {
