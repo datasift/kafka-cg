@@ -459,6 +459,7 @@ func (cg *ConsumerGroup) consumeTopic(topic string, consumers kazoo.Consumergrou
 
 	if len(myPartitions) == 0 {
 		if !cg.config.PermitStandby {
+			cg.Logger.Printf("[%s/%s] [!cg.config.PermitStandby] for topic '%s': %s", cg.group.Name, cg.shortID(), topic, ErrTooManyConsumers.Error())
 			cg.emitError(ErrTooManyConsumers, topic, -1)
 		} else {
 			// wait for rebalance chance
@@ -510,12 +511,12 @@ func (cg *ConsumerGroup) consumePartition(topic string, partition int32, wg *syn
 		} else if err == kazoo.ErrPartitionClaimedByOther {
 			// fail to claim owner after max retries
 			// found in prod env
-			cg.emitError(ErrTooManyConsumers, topic, partition)
 			cg.Logger.Printf("[%s/%s] claim %s/%d: %s", cg.group.Name, cg.shortID(), topic, partition, err)
+			cg.emitError(ErrTooManyConsumers, topic, partition)
 			return
 		} else {
-			cg.emitError(err, topic, partition)
 			cg.Logger.Printf("[%s/%s] claim %s/%d: %s", cg.group.Name, cg.shortID(), topic, partition, err)
+			cg.emitError(err, topic, partition)
 			return
 		}
 	}
