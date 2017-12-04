@@ -56,6 +56,8 @@ func JoinConsumerGroupRealIp(realIp string, name string, topics []string, zookee
 		config = NewConfig()
 	}
 	config.ClientID = name
+
+	// Validate configuration
 	if err = config.Validate(); err != nil {
 		return
 	}
@@ -101,6 +103,7 @@ func JoinConsumerGroupRealIp(realIp string, name string, topics []string, zookee
 		cg.Logger.Printf("[%s/%s] consumer group in zk creating...\n", cg.group.Name, cg.shortID())
 
 		if err := cg.group.Create(); err != nil {
+			cg.Logger.Printf("FAILED to create consumergroup in Zookeeper: %s!\n", err)
 			_ = kz.Close()
 			return nil, err
 		}
@@ -132,10 +135,10 @@ func JoinConsumerGroupRealIp(realIp string, name string, topics []string, zookee
 	// Register itself with zookeeper: consumers/{group}/ids/{instanceId}
 	// This will lead to consumer group rebalance
 	if err := cg.instance.Register(topics); err != nil {
+		cg.Logger.Printf("FAILED to register consumer instance: %s!\n", err)
 		return nil, err
-	} else {
-		cg.Logger.Printf("[%s/%s] cg instance registered in zk for %+v", cg.group.Name, cg.shortID(), topics)
 	}
+	cg.Logger.Printf("[%s/%s] cg instance registered in zk for %+v", cg.group.Name, cg.shortID(), topics)
 
 	// kafka connect
 	// cleanup the kazoo conn in case of failure
@@ -297,7 +300,7 @@ func (cg *ConsumerGroup) consumeTopics(topics []string) {
 
 		for _, topic := range topics {
 			outstanding.Add(2)
-			// TODO no watch, perioically get or when exception occurs in kafka
+			// TODO no watch, periodically get or when exception occurs in kafka
 			go cg.watchTopicPartitionsChange(topic, stopper, topicPartitionsChanged, &outstanding)
 			go cg.consumeTopic(topic, consumers, stopper, &outstanding)
 		}
@@ -493,34 +496,51 @@ func (cg *ConsumerGroup) consumeTopic(topic string, consumers kazoo.Consumergrou
 func (cg *ConsumerGroup) consumePartition(topic string, partition int32, wg *sync.WaitGroup, stopper <-chan struct{}) {
 	defer wg.Done()
 
-	select {
-	case <-stopper:
-		return
-	case <-cg.stopper:
-		return
-	default:
-	}
-
+	// Since ProcessingTimeout is the amount of time we'll wait for the final batch
+	// of messages to be processed before releasing a partition, we need to wait slightly
+	// longer than that before timing out here to ensure that another consumer has had
+	// enough time to release the partition. Hence, +3 seconds.
 	maxRetries := int(cg.config.Offsets.ProcessingTimeout/time.Second) + 3
+partitionClaimLoop:
 	for tries := 0; tries < maxRetries; tries++ {
-		if err := cg.instance.ClaimPartition(topic, partition); err == nil {
-			cg.Logger.Printf("[%s/%s] %s/%d claimed owner", cg.group.Name, cg.shortID(), topic, partition)
-			break
-		} else if err == kazoo.ErrPartitionClaimedByOther && tries+1 < maxRetries {
-			time.Sleep(time.Second)
-		} else if err == kazoo.ErrPartitionClaimedByOther {
-			// fail to claim owner after max retries
-			// found in prod env
-			cg.Logger.Printf("[%s/%s] claim %s/%d: %s", cg.group.Name, cg.shortID(), topic, partition, err)
-			cg.emitError(ErrTooManyConsumers, topic, partition)
-			return
-		} else {
-			cg.Logger.Printf("[%s/%s] claim %s/%d: %s", cg.group.Name, cg.shortID(), topic, partition, err)
-			cg.emitError(err, topic, partition)
-			return
+		select {
+			case <-stopper:
+				return
+			case <-cg.stopper:
+				return
+			case <-time.After(1 * time.Second):
+
+			if err := cg.instance.ClaimPartition(topic, partition); err == nil {
+				cg.Logger.Printf("[%s/%s] %s/%d claimed owner", cg.group.Name, cg.shortID(), topic, partition)
+				break partitionClaimLoop
+			} else if tries+1 < maxRetries {
+				if err == kazoo.ErrPartitionClaimedByOther {
+					// Another consumer still owns this partition. We should wait longer for it to release 
+					time.Sleep(time.Second)
+				} else {
+					// fail to claim owner after max retries
+					// found in prod env
+					cg.Logger.Printf("[%s/%s] FAILED to claim partition %s/%d  on attempt %d of %d; retrying in 1 second. Error: %s", cg.group.Name, cg.shortID(), topic, partition, tries+1, maxRetries, err)
+					cg.emitError(ErrTooManyConsumers, topic, partition)
+				}
+			} else {
+				cg.Logger.Printf("[%s/%s] FAILED to claim partition %s/%d: %s", cg.group.Name, cg.shortID(), topic, partition, err)
+				cg.emitError(err, topic, partition)
+				return
+			}
 		}
 	}
-	defer cg.instance.ReleasePartition(topic, partition)
+	defer func() {
+		err := cg.instance.ReleasePartition(topic, partition)
+		if err != nil {
+			cg.Logger.Printf("%s/%d :: FAILED to release partition: %s\n", topic, partition, err)
+			cg.errors <- &sarama.ConsumerError{
+				Topic:     topic,
+				Partition: partition,
+				Err:       err,
+			}
+		}
+	}()
 
 	nextOffset, err := cg.offsetManager.InitializePartition(topic, partition)
 	if err != nil {
@@ -564,8 +584,8 @@ func (cg *ConsumerGroup) consumePartition(topic string, partition int32, wg *syn
 		// e,g. Tried to send a message to a replica that is not the leader for some partition. Your metadata is out of date
 		// e,g. Request was for a topic or partition that does not exist on this broker
 		// e,g. dial tcp 10.209.18.65:11005: getsockopt: connection refused
-		cg.emitError(err, topic, partition)
 		cg.Logger.Printf("[%s/%s] %s/%d: %s", cg.group.Name, cg.shortID(), topic, partition, err)
+		cg.emitError(err, topic, partition)
 		return
 	}
 	defer consumer.Close()

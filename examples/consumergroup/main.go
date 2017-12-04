@@ -74,7 +74,7 @@ func main() {
 			offsets[message.Topic] = make(map[int32]int64)
 		}
 
-		eventCount += 1
+		eventCount++
 		if offsets[message.Topic][message.Partition] != 0 && offsets[message.Topic][message.Partition] != message.Offset-1 {
 			log.Printf("Unexpected offset on %s:%d. Expected %d, found %d, diff %d.\n", message.Topic, message.Partition, offsets[message.Topic][message.Partition]+1, message.Offset, message.Offset-offsets[message.Topic][message.Partition]+1)
 		}

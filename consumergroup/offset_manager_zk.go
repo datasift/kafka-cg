@@ -119,10 +119,9 @@ func (zom *zookeeperOffsetManager) MarkAsProcessed(topic string, partition int32
 	if p, ok := zom.offsets[topic][partition]; ok {
 		zom.l.RUnlock()
 		return p.markAsProcessed(offset)
-	} else {
-		zom.l.RUnlock()
-		return TopicPartitionNotFound
 	}
+	zom.l.RUnlock()
+	return TopicPartitionNotFound
 }
 
 func (zom *zookeeperOffsetManager) MarkAsConsumed(topic string, partition int32, offset int64) error {
@@ -131,10 +130,9 @@ func (zom *zookeeperOffsetManager) MarkAsConsumed(topic string, partition int32,
 		zom.l.RUnlock()
 		p.markAsConsumed(offset)
 		return nil
-	} else {
-		zom.l.RUnlock()
-		return TopicPartitionNotFound
 	}
+	zom.l.RUnlock()
+	return TopicPartitionNotFound
 }
 
 func (zom *zookeeperOffsetManager) Close() error {
@@ -185,9 +183,8 @@ func (zom *zookeeperOffsetManager) commitOffset(topic string, partition int32, t
 	err := tracker.commit(func(offset int64) error {
 		if offset >= 0 {
 			return zom.cg.group.CommitOffset(topic, partition, offset+1)
-		} else {
-			return nil
 		}
+		return nil
 	})
 
 	if err != nil && err != NoOffsetToCommit {
